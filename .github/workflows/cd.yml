@@ -1,0 +1,133 @@
+name: CD
+
+# Blue-green deploy, after CI passes on main:
+#   1. Build and push the images (docker-build.yml)
+#   2. Deploy them to the staging slots (Green)
+#   3. Health gate against staging. If it fails, the run stops and production is not touched
+#   4. Swap staging into production (Blue)
+#   5. Health gate against production. If it fails, swap back so the previous build returns
+# For a problem found later, run the Rollback workflow (rollback.yml).
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One deploy at a time, in merge order. rollback.yml uses the same group.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-quicktill
+  BACKEND_APP: app-quicktill-ioprww
+  FRONTEND_APP: app-quicktill-web-ioprww
+  SLOT: staging
+  IMAGE_NAMESPACE: onifaith22
+
+jobs:
+  build:
+    name: Build and push images
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit
+
+  deploy-staging:
+    name: Deploy to staging (Green)
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Point the staging slots at the new images
+        run: |
+          az webapp config container set -g "$RESOURCE_GROUP" -n "$BACKEND_APP" -s "$SLOT" \
+            --container-image-name "$IMAGE_NAMESPACE/quicktill-backend:$TAG" -o none
+          az webapp config container set -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" -s "$SLOT" \
+            --container-image-name "$IMAGE_NAMESPACE/quicktill-frontend:$TAG" -o none
+          echo "Staging slots set to \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+  health-gate:
+    name: Health gate (staging)
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      STAGING_API: https://app-quicktill-ioprww-staging.azurewebsites.net
+      STAGING_WEB: https://app-quicktill-web-ioprww-staging.azurewebsites.net
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Azure keeps serving the old container while it pulls the new one, so wait for it
+      - name: Wait for staging to run the new build
+        run: |
+          bash scripts/wait-for-version.sh "$STAGING_API/version" "$TAG"
+          bash scripts/wait-for-version.sh "$STAGING_WEB/version.txt" "$TAG"
+
+      # Same script CI runs on every PR. A failure here fails the job and blocks the swap
+      - name: Run health gate
+        run: bash scripts/health-check.sh "$STAGING_API" "$STAGING_WEB"
+
+  release:
+    name: Swap to production (Blue)
+    needs: [build, health-gate]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      PROD_API: https://app-quicktill-ioprww.azurewebsites.net
+      PROD_WEB: https://app-quicktill-web-ioprww.azurewebsites.net
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap backend
+        id: swap_backend
+        run: az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$BACKEND_APP" --slot "$SLOT" --target-slot production
+
+      - name: Swap frontend
+        id: swap_frontend
+        run: az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" --slot "$SLOT" --target-slot production
+
+      - name: Health gate (production)
+        run: |
+          bash scripts/wait-for-version.sh "$PROD_API/version" "$TAG" 180
+          bash scripts/wait-for-version.sh "$PROD_WEB/version.txt" "$TAG" 180
+          bash scripts/health-check.sh "$PROD_API" "$PROD_WEB"
+          echo "Production is running \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # Automatic rollback: only runs if something above failed, and only swaps back
+      # what was actually swapped. The previous build is still in the staging slot.
+      - name: Roll back frontend
+        if: failure() && steps.swap_frontend.outcome == 'success'
+        run: az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" --slot "$SLOT" --target-slot production
+
+      - name: Roll back backend
+        if: failure() && steps.swap_backend.outcome == 'success'
+        run: az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$BACKEND_APP" --slot "$SLOT" --target-slot production
+
+      - name: Check production after rollback
+        if: failure() && steps.swap_backend.outcome == 'success'
+        run: |
+          echo "Rolled back: \`$TAG\` failed in production" >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/health-check.sh "$PROD_API" "$PROD_WEB"
