@@ -18,7 +18,7 @@ app.get("/health", (req, res) => {
 app.get("/version", (req, res) => {
   res.status(200).json({
     app: "QuickTill",
-    version: "1.0.0",
+    version: process.env.APP_VERSION || "1.0.0",
   });
 });
 

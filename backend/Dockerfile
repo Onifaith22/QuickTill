@@ -8,6 +8,10 @@ RUN npm ci --omit=dev
 # Then copy the rest of the code
 COPY . .
 
+# Release tag (short commit SHA) passed in by the image build workflow, shown on /version
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
+
 ENV PORT=5000
 EXPOSE 5000
 

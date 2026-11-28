@@ -111,4 +111,45 @@ The main repository is maintained centrally to keep the project consistent.
 
 QuickTill is the application used by Group 6 for the **Zero-Downtime Blue-Green Deployment** capstone project.
 
-Docker, Azure App Service deployment slots, GitHub Actions, health-check gates, and rollback procedures will be documented as the team implements them.
+Docker, Azure App Service deployment slots, GitHub Actions, health-check gates, and rollback procedures are described under [Deployment](#deployment).
+
+## Deployment
+
+Every push to `main` goes through this pipeline:
+
+1. **CI** (`ci.yml`) lints, builds and runs the health gate against local containers.
+2. **CD** (`cd.yml`) starts only if CI passed:
+   - builds and pushes both images to Docker Hub (`docker-build.yml`), tagged with the short commit SHA, plus `latest` for the backend and `v2` for the frontend
+   - deploys the SHA-tagged images to the **staging** slots (Green)
+   - runs `scripts/health-check.sh` against staging. If any check fails, the run stops and production is not touched
+   - swaps staging into production (Blue)
+   - runs the health gate against production, and swaps back automatically if it fails
+
+The backend's `/version` and the frontend's `/version.txt` show which build is live.
+
+### Rollback
+
+After every deploy, the staging slots still hold the previous production build.
+
+- **Automatic:** if the production health gate fails right after a swap, CD swaps back.
+- **Manual:** go to Actions → **Rollback** → Run workflow. It swaps staging back into production and runs the health gate. Run it once per bad deploy, because running it again swaps the bad build back in.
+- **An older build:** every build stays on Docker Hub under its SHA tag. Point the staging slot at it, check it, then swap (same for the frontend with `app-quicktill-web-ioprww`):
+
+  ```bash
+  az webapp config container set -g rg-quicktill -n app-quicktill-ioprww -s staging \
+    --container-image-name onifaith22/quicktill-backend:<sha>
+  bash scripts/health-check.sh https://app-quicktill-ioprww-staging.azurewebsites.net
+  az webapp deployment slot swap -g rg-quicktill -n app-quicktill-ioprww --slot staging --target-slot production
+  ```
+
+### Setup
+
+- Repository variable `DOCKERHUB_USERNAME` and secret `DOCKERHUB_TOKEN`
+- Secret `AZURE_CREDENTIALS`: lets GitHub Actions sign in to Azure. It is a service principal limited to `rg-quicktill` with the Website Contributor role, which can change the web apps' images and swap slots but nothing else. Created by someone with access to the Azure subscription:
+
+  ```bash
+  az ad sp create-for-rbac --name quicktill-github --role "Website Contributor" \
+    --scopes /subscriptions/<subscription-id>/resourceGroups/rg-quicktill --json-auth
+  ```
+
+  The JSON it prints is pasted as the secret's value.

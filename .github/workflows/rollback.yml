@@ -1,0 +1,53 @@
+name: Rollback
+
+# Manual rollback to the previous known-good build.
+# After every deploy the staging slots still hold the build that was in production before,
+# so swapping them back restores it in seconds, then the health gate checks production.
+# Run it from Actions > Rollback > Run workflow, once per bad deploy: running it a second
+# time swaps the bad build back in.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never swap while a deploy is running
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-quicktill
+  BACKEND_APP: app-quicktill-ioprww
+  FRONTEND_APP: app-quicktill-web-ioprww
+  SLOT: staging
+  PROD_API: https://app-quicktill-ioprww.azurewebsites.net
+  PROD_WEB: https://app-quicktill-web-ioprww.azurewebsites.net
+  STAGING_API: https://app-quicktill-ioprww-staging.azurewebsites.net
+
+jobs:
+  rollback:
+    name: Swap production back
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show what each slot is running
+        run: |
+          echo "Production: $(curl -fsS --max-time 5 "$PROD_API/version" || echo 'no answer')"
+          echo "Staging:    $(curl -fsS --max-time 5 "$STAGING_API/version" || echo 'no answer')"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap staging back into production
+        run: |
+          az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$BACKEND_APP" --slot "$SLOT" --target-slot production
+          az webapp deployment slot swap -g "$RESOURCE_GROUP" -n "$FRONTEND_APP" --slot "$SLOT" --target-slot production
+
+      - name: Health gate (production)
+        run: |
+          echo "Production now: $(curl -fsS --max-time 5 "$PROD_API/version")" >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/health-check.sh "$PROD_API" "$PROD_WEB"

@@ -13,6 +13,11 @@ RUN npm run build
 # Stage 2: serve the built files with nginx
 FROM nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
+
+# Release tag (short commit SHA) from the image build workflow, so CD can check which build is live
+ARG APP_VERSION=dev
+RUN echo "$APP_VERSION" > /usr/share/nginx/html/version.txt
+
 EXPOSE 80
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
